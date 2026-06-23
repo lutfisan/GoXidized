@@ -1,5 +1,66 @@
+# GoXidized local runtime files
 .env
-data/
+.env.*
+!.env.example
+config.yaml
+devices.csv
+known_hosts
+known_hosts.*
+secrets.enc
 *.enc
-known_hosts*
+
+# GoXidized generated state
+data/
+repos/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build outputs
+bin/
+dist/
+build/
+out/
+goxidized
+goxidized.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test and coverage artifacts
 coverage.out
+coverage.html
+*.cover
+*.test
+*.prof
+cpu.out
+mem.out
+trace.out
+
+# Go workspace/cache files that should stay local
+go.work
+go.work.sum
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker/local compose overrides
+compose.override.yaml
+docker-compose.override.yml
