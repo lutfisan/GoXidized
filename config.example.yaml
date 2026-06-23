@@ -1,0 +1,78 @@
+server:
+  listen_address: 127.0.0.1:8080
+  tls_enabled: false
+  tls_cert_file: ""
+  tls_key_file: ""
+  auth:
+    api_tokens_enabled: true
+    bootstrap_token_env: GOXIDIZED_BOOTSTRAP_TOKEN
+    oidc_enabled: false
+
+scheduler:
+  default_interval: 24h
+  jitter_percent: 20
+  max_global_concurrency: 250
+  max_new_connections_per_second: 10
+  max_per_site_concurrency: 30
+  max_per_vendor_concurrency: 100
+  max_per_group_concurrency: 100
+  queue_size: 10000
+  retry:
+    max_attempts: 3
+    backoff_initial: 30s
+    backoff_max: 30m
+
+inventory:
+  refresh_interval: 5m
+  sources:
+    - name: primary-csv
+      type: csv
+      path: devices.csv
+
+credentials:
+  default_provider: dotenv
+  dotenv:
+    file_path: .env
+    require_chmod_600: true
+  encrypted_file:
+    path: secrets.enc
+    kms_key_env: GOXIDIZED_KMS_KEY
+
+storage:
+  metadata:
+    type: postgres
+    dsn_env: GOXIDIZED_POSTGRES_DSN
+  config:
+    type: git
+    shard_strategy: role
+    shard_count: 0
+    base_path: data/repos
+    author_name: GoXidized
+    author_email: goxidized@example.invalid
+
+redaction:
+  enabled: true
+  strict_mode: true
+  raw_storage_enabled: false
+  hmac_key_env: GOXIDIZED_REDACTION_HMAC_KEY
+
+transport:
+  ssh:
+    connect_timeout: 20s
+    auth_timeout: 20s
+    command_timeout: 60s
+    idle_timeout: 30s
+    session_deadline: 3m
+    host_key_mode: strict
+    known_hosts_path: known_hosts
+    tofu_path: known_hosts.tofu
+  telnet:
+    enabled: false
+
+retention:
+  days: 365
+
+observability:
+  metrics_enabled: true
+  tracing_enabled: false
+  log_format: json

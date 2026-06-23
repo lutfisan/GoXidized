@@ -1,0 +1,4 @@
+id,hostname,ip_address,port,vendor,group,site,role,tags,jump_host,credential_ref,enabled,telnet_enabled
+lab-xe-1,lab-xe-1,192.0.2.10,22,cisco_iosxe,lab,dc1,core,lab|iosxe,,dotenv://LAB_XE_1,true,false
+lab-vrp-1,lab-vrp-1,192.0.2.11,22,huawei_vrp,lab,dc1,aggregation,lab|huawei,,dotenv://LAB_VRP_1,true,false
+disabled-zte-legacy,disabled-zte-legacy,192.0.2.12,23,zte_zxr10,legacy,dc2,access,legacy,,dotenv://ZTE_LEGACY,false,true

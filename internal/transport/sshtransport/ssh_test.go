@@ -1,0 +1,63 @@
+package sshtransport
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"net"
+	"os"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+func TestTOFURejectsHostKeyChange(t *testing.T) {
+	key1 := testPublicKey(t)
+	key2 := testPublicKey(t)
+	path := t.TempDir() + "/known_hosts"
+	if err := os.WriteFile(path, []byte(knownhosts.Line([]string{"example.com"}, key1)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cb := New(Config{HostKeyMode: "tofu", TOFUPath: path}).tofuCallback(path)
+	err := cb("example.com", &net.TCPAddr{}, key2)
+	if err == nil {
+		t.Fatalf("expected host-key mismatch error")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "example.com") != 1 {
+		t.Fatalf("tofu appended changed key: %s", data)
+	}
+}
+
+func TestTOFUAppendsUnknownHost(t *testing.T) {
+	key := testPublicKey(t)
+	path := t.TempDir() + "/known_hosts"
+	cb := New(Config{HostKeyMode: "tofu", TOFUPath: path}).tofuCallback(path)
+	if err := cb("new.example.com", &net.TCPAddr{}, key); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "new.example.com") {
+		t.Fatalf("tofu did not append unknown host: %s", data)
+	}
+}
+
+func testPublicKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}

@@ -1,0 +1,109 @@
+openapi: 3.0.3
+info:
+  title: GoXidized API
+  version: 0.1.0
+paths:
+  /healthz:
+    get:
+      responses:
+        "200":
+          description: Process is alive.
+  /readyz:
+    get:
+      responses:
+        "200":
+          description: Dependencies are ready.
+  /metrics:
+    get:
+      responses:
+        "200":
+          description: Prometheus metrics.
+  /api/v1/devices:
+    get:
+      responses:
+        "200":
+          description: List devices.
+  /api/v1/devices/{id}:
+    get:
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Device detail.
+  /api/v1/devices/{id}/backup:
+    post:
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202":
+          description: Backup queued.
+  /api/v1/groups/{group}/backup:
+    post:
+      parameters:
+        - name: group
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "202":
+          description: Group backup queued.
+  /api/v1/devices/{id}/configs:
+    get:
+      responses:
+        "200":
+          description: Revision history.
+  /api/v1/devices/{id}/configs/latest:
+    get:
+      responses:
+        "200":
+          description: Latest sanitized config.
+  /api/v1/devices/{id}/configs/diff:
+    get:
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Unified diff.
+  /api/v1/jobs:
+    get:
+      responses:
+        "200":
+          description: Job list.
+  /api/v1/jobs/{id}:
+    get:
+      responses:
+        "200":
+          description: Job detail.
+  /api/v1/inventory/reload:
+    post:
+      responses:
+        "200":
+          description: Inventory reloaded.
+  /api/v1/drivers:
+    get:
+      responses:
+        "200":
+          description: Registered drivers.
+  /api/v1/drivers/{name}/test:
+    post:
+      responses:
+        "202":
+          description: Driver test endpoint registered.
+  /api/v1/audit/events:
+    get:
+      responses:
+        "200":
+          description: Audit event list.

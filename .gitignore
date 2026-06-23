@@ -1,0 +1,5 @@
+.env
+data/
+*.enc
+known_hosts*
+coverage.out
