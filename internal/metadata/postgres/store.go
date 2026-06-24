@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"goxidized/internal/scheduler"
 	"goxidized/pkg/goxidized"
 )
 
@@ -198,6 +199,55 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$7)`,
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) TryAcquireLease(ctx context.Context, lease scheduler.WorkerLease) (bool, error) {
+	if err := lease.Validate(); err != nil {
+		return false, err
+	}
+	var targetID string
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO worker_leases (target_id, worker_id, job_id, expires_at, updated_at)
+VALUES ($1,$2,$3,$4,$5)
+ON CONFLICT (target_id) DO UPDATE SET
+    worker_id=EXCLUDED.worker_id,
+    job_id=EXCLUDED.job_id,
+    expires_at=EXCLUDED.expires_at,
+    updated_at=EXCLUDED.updated_at
+WHERE worker_leases.expires_at <= $5
+   OR (worker_leases.worker_id = $2 AND worker_leases.job_id = $3)
+RETURNING target_id`,
+		lease.TargetID, lease.WorkerID, lease.JobID, lease.ExpiresAt, lease.Now).Scan(&targetID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) RenewLease(ctx context.Context, lease scheduler.WorkerLease) (bool, error) {
+	if err := lease.Validate(); err != nil {
+		return false, err
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE worker_leases
+SET expires_at=$4, updated_at=$5
+WHERE target_id=$1 AND worker_id=$2 AND job_id=$3 AND expires_at > $5`,
+		lease.TargetID, lease.WorkerID, lease.JobID, lease.ExpiresAt, lease.Now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *Store) ReleaseLease(ctx context.Context, lease scheduler.WorkerLease) error {
+	if lease.TargetID == "" || lease.WorkerID == "" || lease.JobID == "" {
+		return errors.New("lease target id, worker id, and job id are required")
+	}
+	_, err := s.pool.Exec(ctx, `
+DELETE FROM worker_leases
+WHERE target_id=$1 AND worker_id=$2 AND job_id=$3`,
+		lease.TargetID, lease.WorkerID, lease.JobID)
+	return err
 }
 
 func (s *Store) SaveRevision(ctx context.Context, rev goxidized.Revision, meta goxidized.CommitMeta) error {

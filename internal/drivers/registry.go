@@ -44,21 +44,21 @@ func List() []string {
 
 func RegisterDefaults() {
 	Register("cisco_iosxe", func() goxidized.Driver {
-		return NewCLI("cisco_iosxe", []string{"terminal length 0"}, "show running-config")
+		return NewCLIProfile(ciscoIOSXEProfile())
 	})
 	Register("huawei_vrp", func() goxidized.Driver {
-		return NewCLI("huawei_vrp", []string{"screen-length 0 temporary"}, "display current-configuration")
+		return NewCLIProfile(huaweiVRPProfile())
 	})
 	Register("cisco_iosxr", func() goxidized.Driver {
-		return NewCLI("cisco_iosxr", []string{"terminal length 0"}, "show running-config")
+		return NewCLIProfile(ciscoIOSXRProfile())
 	})
 	Register("juniper_junos", func() goxidized.Driver {
-		return NewCLI("juniper_junos", nil, "show configuration | display set")
+		return NewCLIProfile(juniperJunosProfile())
 	})
 	Register("ericsson_ipos", func() goxidized.Driver {
-		return NewCLI("ericsson_ipos", nil, "show configuration")
+		return NewCLIProfile(ericssonIPOSProfile())
 	})
 	Register("zte_zxr10", func() goxidized.Driver {
-		return NewCLI("zte_zxr10", []string{"terminal length 0"}, "show running-config")
+		return NewCLIProfile(zteZXR10Profile())
 	})
 }

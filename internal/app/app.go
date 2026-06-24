@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,6 +32,7 @@ type App struct {
 	Scheduler *scheduler.Manager
 	Runner    *worker.BackupRunner
 	API       http.Handler
+	schedule  *scheduler.Planner
 	logger    *slog.Logger
 }
 
@@ -65,25 +67,46 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 	}
 	creds := credentials.Router{Default: defaultProvider, Providers: providers}
 	sshDialer := sshtransport.New(sshtransport.Config{
-		ConnectTimeout:  cfg.Transport.SSH.ConnectTimeout,
-		AuthTimeout:     cfg.Transport.SSH.AuthTimeout,
-		CommandTimeout:  cfg.Transport.SSH.CommandTimeout,
-		IdleTimeout:     cfg.Transport.SSH.IdleTimeout,
-		SessionDeadline: cfg.Transport.SSH.SessionDeadline,
-		HostKeyMode:     cfg.Transport.SSH.HostKeyMode, KnownHostsPath: cfg.Transport.SSH.KnownHostsPath, TOFUPath: cfg.Transport.SSH.TOFUPath,
+		ConnectTimeout:   cfg.Transport.SSH.ConnectTimeout,
+		AuthTimeout:      cfg.Transport.SSH.AuthTimeout,
+		CommandTimeout:   cfg.Transport.SSH.CommandTimeout,
+		IdleTimeout:      cfg.Transport.SSH.IdleTimeout,
+		SessionDeadline:  cfg.Transport.SSH.SessionDeadline,
+		InteractiveShell: cfg.Transport.SSH.InteractiveShell,
+		PromptPattern:    cfg.Transport.SSH.PromptPattern,
+		MaxOutputBytes:   cfg.Transport.SSH.MaxOutputBytes,
+		HostKeyMode:      cfg.Transport.SSH.HostKeyMode, KnownHostsPath: cfg.Transport.SSH.KnownHostsPath, TOFUPath: cfg.Transport.SSH.TOFUPath,
 		InsecureWarning: func(msg string) { logger.Warn(msg) },
 	})
-	telnetDialer := telnettransport.New(cfg.Transport.Telnet.Enabled)
+	telnetDialer := telnettransport.NewConfig(telnettransport.Config{
+		Enabled:        cfg.Transport.Telnet.Enabled,
+		ConnectTimeout: cfg.Transport.Telnet.ConnectTimeout,
+		LoginTimeout:   cfg.Transport.Telnet.LoginTimeout,
+		CommandTimeout: cfg.Transport.Telnet.CommandTimeout,
+		IdleTimeout:    cfg.Transport.Telnet.IdleTimeout,
+		PromptPattern:  cfg.Transport.Telnet.PromptPattern,
+		MaxOutputBytes: cfg.Transport.Telnet.MaxOutputBytes,
+	})
 	runner := &worker.BackupRunner{
 		Metadata: meta, Storage: storage, Credentials: creds, SSHDialer: sshDialer, TelnetDialer: telnetDialer, Drivers: drivers.Get,
+	}
+	schedule, err := buildSchedulePlanner(cfg.Scheduler)
+	if err != nil {
+		meta.Close()
+		return nil, err
+	}
+	var leaseStore scheduler.LeaseStore
+	if cfg.Scheduler.Lease.Enabled {
+		leaseStore = meta
 	}
 	mgr := scheduler.New(scheduler.Config{
 		QueueSize: cfg.Scheduler.QueueSize, MaxGlobalConcurrency: cfg.Scheduler.MaxGlobalConcurrency,
 		MaxPerVendorConcurrency: cfg.Scheduler.MaxPerVendorConcurrency, MaxPerGroupConcurrency: cfg.Scheduler.MaxPerGroupConcurrency,
 		MaxPerSiteConcurrency: cfg.Scheduler.MaxPerSiteConcurrency, MaxNewConnectionsPerSecond: cfg.Scheduler.MaxNewConnectionsPerSecond,
 		MaxAttempts: cfg.Scheduler.Retry.MaxAttempts, BackoffInitial: cfg.Scheduler.Retry.BackoffInitial, BackoffMax: cfg.Scheduler.Retry.BackoffMax,
+		WorkerID: cfg.Scheduler.Lease.WorkerID, LeaseStore: leaseStore, LeaseTTL: cfg.Scheduler.Lease.TTL, LeaseRenewInterval: cfg.Scheduler.Lease.RenewInterval,
 	}, runner.Handle)
-	a := &App{Config: cfg, Metadata: meta, Storage: storage, Scheduler: mgr, Runner: runner, logger: logger}
+	a := &App{Config: cfg, Metadata: meta, Storage: storage, Scheduler: mgr, Runner: runner, schedule: schedule, logger: logger}
 	a.API = api.Server{
 		Metadata: meta, TokenValidator: meta, Storage: storage, Scheduler: mgr, Drivers: drivers.List, ReloadInventory: a.ReloadInventory,
 		BootstrapToken: os.Getenv(cfg.Server.Auth.BootstrapTokenEnv), AuthRequired: cfg.Server.Auth.APITokensEnabled, StartedAt: time.Now().UTC(),
@@ -155,26 +178,42 @@ func (a *App) Start(ctx context.Context) error {
 }
 
 func (a *App) startSweeper(ctx context.Context) {
-	interval := a.Config.Scheduler.DefaultInterval
-	if interval <= 0 {
+	if a.schedule == nil {
 		return
 	}
 	go func() {
-		a.enqueueSweep(ctx)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		base, err := a.schedule.InitialBase(time.Now().UTC())
+		if err != nil {
+			a.logger.Warn("scheduler disabled", "error", err)
+			return
+		}
 		for {
+			if wait := time.Until(base); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+			a.enqueueSweep(ctx, base)
+			next, err := a.schedule.NextBase(base)
+			if err != nil {
+				a.logger.Warn("scheduler stopped", "error", err)
+				return
+			}
+			base = next
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				a.enqueueSweep(ctx)
+			default:
 			}
 		}
 	}()
 }
 
-func (a *App) enqueueSweep(ctx context.Context) {
+func (a *App) enqueueSweep(ctx context.Context, base time.Time) {
 	devices, err := a.Metadata.ListDevices(ctx)
 	if err != nil {
 		a.logger.Warn("sweep inventory read failed", "error", err)
@@ -184,25 +223,71 @@ func (a *App) enqueueSweep(ctx context.Context) {
 		if !t.Enabled {
 			continue
 		}
-		delay := deterministicJitter(t.ID, a.Config.Scheduler.DefaultInterval, a.Config.Scheduler.JitterPercent)
-		job := goxidized.Job{TargetID: t.ID, Group: t.Group, Trigger: "schedule", Actor: "scheduler", Status: goxidized.StatusQueued, QueuedAt: time.Now().UTC().Add(delay)}
+		decision, err := a.schedule.QueueTime(base, t)
+		if err != nil {
+			a.logger.Warn("sweep schedule skipped", "target_id", t.ID, "error", err)
+			continue
+		}
+		job := goxidized.Job{TargetID: t.ID, Group: t.Group, Trigger: "schedule", Actor: "scheduler", Status: goxidized.StatusQueued, QueuedAt: decision.QueueAt}
 		if err := a.Scheduler.Enqueue(ctx, scheduler.Request{Job: job, Target: t}); err != nil {
 			a.logger.Debug("sweep enqueue skipped", "target_id", t.ID, "error", err)
 		}
 	}
 }
 
-func deterministicJitter(key string, interval time.Duration, percent int) time.Duration {
-	if percent <= 0 || interval <= 0 {
-		return 0
+func buildSchedulePlanner(cfg config.SchedulerConfig) (*scheduler.Planner, error) {
+	if cfg.DefaultInterval <= 0 && cfg.Cron == "" {
+		return nil, nil
 	}
-	max := interval * time.Duration(percent) / 100
-	if max <= 0 {
-		return 0
+	loc := time.UTC
+	if cfg.Timezone != "" {
+		loaded, err := time.LoadLocation(cfg.Timezone)
+		if err != nil {
+			return nil, fmt.Errorf("scheduler.timezone: %w", err)
+		}
+		loc = loaded
 	}
-	var n uint64
-	for _, b := range []byte(key) {
-		n = n*131 + uint64(b)
+	windows, err := buildScheduleWindows(cfg.Windows, loc)
+	if err != nil {
+		return nil, err
 	}
-	return time.Duration(n % uint64(max))
+	blackouts, err := buildScheduleWindows(cfg.Blackouts, loc)
+	if err != nil {
+		return nil, err
+	}
+	return scheduler.NewPlanner(scheduler.SchedulePolicy{
+		Interval: cfg.DefaultInterval, Cron: cfg.Cron, Location: loc, JitterPercent: cfg.JitterPercent, JitterMax: cfg.JitterMax,
+		Windows: windows, Blackouts: blackouts,
+	})
+}
+
+func buildScheduleWindows(in []config.WindowConfig, fallback *time.Location) ([]scheduler.ScheduleWindow, error) {
+	out := make([]scheduler.ScheduleWindow, 0, len(in))
+	for _, window := range in {
+		loc := fallback
+		if window.Timezone != "" {
+			loaded, err := time.LoadLocation(window.Timezone)
+			if err != nil {
+				return nil, fmt.Errorf("scheduler window %q timezone: %w", window.Name, err)
+			}
+			loc = loaded
+		}
+		start, err := scheduler.ParseClock(window.Start)
+		if err != nil {
+			return nil, fmt.Errorf("scheduler window %q start: %w", window.Name, err)
+		}
+		end, err := scheduler.ParseClock(window.End)
+		if err != nil {
+			return nil, fmt.Errorf("scheduler window %q end: %w", window.Name, err)
+		}
+		days, err := scheduler.ParseWeekdays(window.Days)
+		if err != nil {
+			return nil, fmt.Errorf("scheduler window %q days: %w", window.Name, err)
+		}
+		out = append(out, scheduler.ScheduleWindow{
+			Name: window.Name, Days: days, Start: start, End: end, Location: loc,
+			Groups: window.Groups, Sites: window.Sites, Vendors: window.Vendors, Roles: window.Roles,
+		})
+	}
+	return out, nil
 }

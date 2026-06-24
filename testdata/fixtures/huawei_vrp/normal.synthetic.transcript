@@ -1,0 +1,15 @@
+<core-vrp-1>display current-configuration
+Info: Current configuration is 2048 bytes.
+#
+sysname core-vrp-1
+super password cipher huaweiSuper
+local-user backup password irreversible-cipher huaweiLocal
+snmp-agent community read huaweiPublic
+hwtacacs-server template tac
+ hwtacacs-server shared-key cipher huaweiTacacs
+  ---- More ----
+interface GigabitEthernet0/0/0
+ description uplink
+ ip address 192.0.2.2 255.255.255.0
+#
+<core-vrp-1>

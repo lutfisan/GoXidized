@@ -10,7 +10,11 @@ server:
 
 scheduler:
   default_interval: 24h
+  # Use either default_interval or a five-field cron expression.
+  # cron: "0 */6 * * *"
+  timezone: UTC
   jitter_percent: 20
+  jitter_max: 0s
   max_global_concurrency: 250
   max_new_connections_per_second: 10
   max_per_site_concurrency: 30
@@ -21,6 +25,31 @@ scheduler:
     max_attempts: 3
     backoff_initial: 30s
     backoff_max: 30m
+  lease:
+    enabled: true
+    worker_id: ""
+    ttl: 15m
+    renew_interval: 5m
+  windows:
+    - name: weekday-business-hours
+      days: [weekdays]
+      start: "09:00"
+      end: "17:00"
+      timezone: UTC
+      groups: []
+      sites: []
+      vendors: []
+      roles: []
+  blackouts:
+    - name: monday-maintenance
+      days: [monday]
+      start: "10:00"
+      end: "11:00"
+      timezone: UTC
+      groups: []
+      sites: []
+      vendors: []
+      roles: []
 
 inventory:
   refresh_interval: 5m
@@ -63,11 +92,20 @@ transport:
     command_timeout: 60s
     idle_timeout: 30s
     session_deadline: 3m
+    interactive_shell: true
+    prompt_pattern: '(?m)(^|\n)[^\n]{1,96}[>#]\s*$'
+    max_output_bytes: 16777216
     host_key_mode: strict
     known_hosts_path: known_hosts
     tofu_path: known_hosts.tofu
   telnet:
     enabled: false
+    connect_timeout: 20s
+    login_timeout: 20s
+    command_timeout: 60s
+    idle_timeout: 30s
+    prompt_pattern: '(?m)(^|\n)[^\n]{1,96}[>#]\s*$'
+    max_output_bytes: 16777216
 
 retention:
   days: 365

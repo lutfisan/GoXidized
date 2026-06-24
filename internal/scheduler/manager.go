@@ -2,9 +2,12 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -32,6 +35,11 @@ type Config struct {
 	BackoffMax                 time.Duration
 	CircuitFailureThreshold    int
 	CircuitOpenDuration        time.Duration
+	WorkerID                   string
+	LeaseStore                 LeaseStore
+	LeaseTTL                   time.Duration
+	LeaseRenewInterval         time.Duration
+	Clock                      func() time.Time
 }
 
 type Manager struct {
@@ -47,6 +55,14 @@ type Manager struct {
 	site   map[string]chan struct{}
 	active map[string]struct{}
 	cb     map[string]circuit
+
+	workerID           string
+	leases             LeaseStore
+	leaseTTL           time.Duration
+	leaseRenewInterval time.Duration
+	leased             map[string]WorkerLease
+	renewerOnce        sync.Once
+	clock              func() time.Time
 }
 
 type circuit struct {
@@ -61,12 +77,47 @@ func New(cfg Config, handler Handler) *Manager {
 		queue: make(chan Request, cfg.QueueSize), global: make(chan struct{}, cfg.MaxGlobalConcurrency),
 		vendor: map[string]chan struct{}{}, group: map[string]chan struct{}{}, site: map[string]chan struct{}{},
 		active: map[string]struct{}{}, cb: map[string]circuit{},
+		workerID: cfg.WorkerID, leases: cfg.LeaseStore, leaseTTL: cfg.LeaseTTL, leaseRenewInterval: cfg.LeaseRenewInterval,
+		leased: map[string]WorkerLease{}, clock: cfg.Clock,
 	}
 }
 
 func (m *Manager) Enqueue(ctx context.Context, req Request) error {
+	var err error
+	req, err = m.prepare(req)
+	if err != nil {
+		return err
+	}
+	if delay := req.Job.QueuedAt.Sub(m.now()); delay > 0 {
+		next := req
+		go func() {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+				next.Job.QueuedAt = m.now()
+				_ = m.Enqueue(ctx, next)
+			}
+		}()
+		return nil
+	}
+	if err := m.reserve(ctx, req); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		m.releaseReservation(context.Background(), req)
+		return ctx.Err()
+	case m.queue <- req:
+		return nil
+	}
+}
+
+func (m *Manager) prepare(req Request) (Request, error) {
 	if req.Target.ID == "" {
-		return errors.New("target id is required")
+		return Request{}, errors.New("target id is required")
 	}
 	if req.Job.TargetID == "" {
 		req.Job.TargetID = req.Target.ID
@@ -80,50 +131,63 @@ func (m *Manager) Enqueue(ctx context.Context, req Request) error {
 	if req.Job.Attempt == 0 {
 		req.Job.Attempt = 1
 	}
+	if req.Job.ID == "" {
+		req.Job.ID = newJobID()
+	}
 	if req.Job.QueuedAt.IsZero() {
-		req.Job.QueuedAt = time.Now().UTC()
+		req.Job.QueuedAt = m.now()
 	}
-	if delay := time.Until(req.Job.QueuedAt); delay > 0 {
-		next := req
-		go func() {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-			case <-timer.C:
-				next.Job.QueuedAt = time.Now().UTC()
-				_ = m.Enqueue(ctx, next)
-			}
-		}()
-		return nil
-	}
+	return req, nil
+}
+
+func (m *Manager) reserve(ctx context.Context, req Request) error {
+	now := m.now()
 	m.mu.Lock()
 	if _, ok := m.active[req.Target.ID]; ok {
 		m.mu.Unlock()
-		return fmt.Errorf("target %s already has an active job", req.Target.ID)
+		return fmt.Errorf("%w: target %s", ErrDuplicateActive, req.Target.ID)
 	}
-	if c := m.cb[req.Target.ID]; time.Now().Before(c.openUntil) {
+	if c := m.cb[req.Target.ID]; now.Before(c.openUntil) {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: target %s circuit open until %s", ErrCircuitOpen, req.Target.ID, c.openUntil.Format(time.RFC3339))
 	}
 	m.active[req.Target.ID] = struct{}{}
 	m.mu.Unlock()
 
-	select {
-	case <-ctx.Done():
-		m.clearActive(req.Target.ID)
-		return ctx.Err()
-	case m.queue <- req:
+	if m.leases == nil {
 		return nil
 	}
+	lease := WorkerLease{
+		TargetID:  req.Target.ID,
+		WorkerID:  m.workerID,
+		JobID:     req.Job.ID,
+		Now:       now,
+		ExpiresAt: now.Add(m.leaseTTL),
+	}
+	ok, err := m.leases.TryAcquireLease(ctx, lease)
+	if err != nil {
+		m.clearActive(req.Target.ID)
+		return err
+	}
+	if !ok {
+		m.clearActive(req.Target.ID)
+		return fmt.Errorf("%w: target %s", ErrLeaseHeld, req.Target.ID)
+	}
+	m.mu.Lock()
+	m.leased[req.Target.ID] = lease
+	m.mu.Unlock()
+	return nil
 }
 
 var ErrCircuitOpen = errors.New("circuit open")
+var ErrDuplicateActive = errors.New("target already has an active job")
+var ErrLeaseHeld = errors.New("target lease is held")
 
 func (m *Manager) Start(ctx context.Context, workers int) {
 	if workers <= 0 {
 		workers = m.cfg.MaxGlobalConcurrency
 	}
+	m.startLeaseRenewer(ctx)
 	for i := 0; i < workers; i++ {
 		go m.worker(ctx)
 	}
@@ -145,7 +209,7 @@ func (m *Manager) worker(ctx context.Context) {
 }
 
 func (m *Manager) run(ctx context.Context, req Request) {
-	defer m.clearActive(req.Target.ID)
+	defer m.releaseReservation(context.Background(), req)
 	if err := m.acquire(ctx, req.Target); err != nil {
 		return
 	}
@@ -162,9 +226,10 @@ func (m *Manager) run(ctx context.Context, req Request) {
 	if req.Job.Attempt < m.cfg.MaxAttempts {
 		next := req
 		next.Job.Attempt++
-		next.Job.QueuedAt = time.Now().UTC().Add(backoff(m.cfg, req.Job.Attempt))
+		next.Job.ID = ""
+		next.Job.QueuedAt = m.now().Add(backoff(m.cfg, req.Job.Attempt))
 		go func() {
-			timer := time.NewTimer(time.Until(next.Job.QueuedAt))
+			timer := time.NewTimer(next.Job.QueuedAt.Sub(m.now()))
 			defer timer.Stop()
 			select {
 			case <-ctx.Done():
@@ -234,9 +299,81 @@ func (m *Manager) recordFailure(targetID string) {
 	c := m.cb[targetID]
 	c.failures++
 	if c.failures >= m.cfg.CircuitFailureThreshold {
-		c.openUntil = time.Now().Add(m.cfg.CircuitOpenDuration)
+		c.openUntil = m.now().Add(m.cfg.CircuitOpenDuration)
 	}
 	m.cb[targetID] = c
+}
+
+func (m *Manager) releaseReservation(ctx context.Context, req Request) {
+	if m.leases != nil {
+		lease, ok := m.takeLease(req.Target.ID)
+		if ok {
+			_ = m.leases.ReleaseLease(ctx, lease)
+		}
+	}
+	m.clearActive(req.Target.ID)
+}
+
+func (m *Manager) takeLease(targetID string) (WorkerLease, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lease, ok := m.leased[targetID]
+	if ok {
+		delete(m.leased, targetID)
+	}
+	return lease, ok
+}
+
+func (m *Manager) snapshotLeases() []WorkerLease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]WorkerLease, 0, len(m.leased))
+	for _, lease := range m.leased {
+		out = append(out, lease)
+	}
+	return out
+}
+
+func (m *Manager) startLeaseRenewer(ctx context.Context) {
+	if m.leases == nil {
+		return
+	}
+	m.renewerOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(m.leaseRenewInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					m.renewLeases(ctx)
+				}
+			}
+		}()
+	})
+}
+
+func (m *Manager) renewLeases(ctx context.Context) {
+	now := m.now()
+	for _, lease := range m.snapshotLeases() {
+		lease.Now = now
+		lease.ExpiresAt = now.Add(m.leaseTTL)
+		if ok, err := m.leases.RenewLease(ctx, lease); err == nil && ok {
+			m.mu.Lock()
+			if current, exists := m.leased[lease.TargetID]; exists && current.JobID == lease.JobID && current.WorkerID == lease.WorkerID {
+				m.leased[lease.TargetID] = lease
+			}
+			m.mu.Unlock()
+		}
+	}
+}
+
+func (m *Manager) now() time.Time {
+	if m.clock == nil {
+		return time.Now().UTC()
+	}
+	return m.clock().UTC()
 }
 
 func normalize(cfg Config) Config {
@@ -273,6 +410,21 @@ func normalize(cfg Config) Config {
 	if cfg.CircuitOpenDuration <= 0 {
 		cfg.CircuitOpenDuration = 30 * time.Minute
 	}
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = defaultWorkerID()
+	}
+	if cfg.LeaseTTL <= 0 {
+		cfg.LeaseTTL = 15 * time.Minute
+	}
+	if cfg.LeaseRenewInterval <= 0 {
+		cfg.LeaseRenewInterval = cfg.LeaseTTL / 3
+		if cfg.LeaseRenewInterval <= 0 {
+			cfg.LeaseRenewInterval = time.Minute
+		}
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = func() time.Time { return time.Now().UTC() }
+	}
 	return cfg
 }
 
@@ -289,4 +441,20 @@ func backoff(cfg Config, attempt int) time.Duration {
 
 func isSuccess(status goxidized.JobStatus) bool {
 	return status == goxidized.StatusSuccessChanged || status == goxidized.StatusSuccessNoChange
+}
+
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
+
+func newJobID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("job-%d", time.Now().UnixNano())
+	}
+	return "job-" + hex.EncodeToString(b[:])
 }

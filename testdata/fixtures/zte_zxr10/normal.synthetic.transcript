@@ -1,0 +1,18 @@
+ZXR10#show running-config
+Building configuration...
+Current configuration : 2048 bytes
+!
+hostname zxr10-edge-1
+enable secret 5 zteEnable
+username backup privilege 15 secret 5 zteUser
+snmp-server community ztePublic ro
+radius-server host 192.0.2.50 key zteRadius
+router ospf 100
+ area 0
+  authentication-key zteOspf
+---- More ----
+interface gei-0/1/0/1
+ description uplink
+ ip address 192.0.2.5 255.255.255.0
+!
+ZXR10#

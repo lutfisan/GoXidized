@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS worker_leases (
     expires_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS worker_leases_expires_idx ON worker_leases (expires_at);
 
 CREATE TABLE IF NOT EXISTS circuit_breakers (
     target_id text PRIMARY KEY,
@@ -229,7 +230,7 @@ ON CONFLICT (id) DO UPDATE SET
     permissions = EXCLUDED.permissions;
 
 INSERT INTO schema_migrations (version)
-VALUES ('0001_init.sql')
+VALUES ('0001_init.sql'), ('0002_worker_leases.sql')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

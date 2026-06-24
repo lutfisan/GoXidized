@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -49,6 +50,44 @@ func TestTOFUAppendsUnknownHost(t *testing.T) {
 	}
 }
 
+func TestParseJumpHost(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		user string
+		host string
+		port string
+	}{
+		{name: "host only", raw: "bastion.example.com", user: "netops", host: "bastion.example.com", port: "22"},
+		{name: "host port", raw: "bastion.example.com:2222", user: "netops", host: "bastion.example.com", port: "2222"},
+		{name: "user host port", raw: "jumpuser@bastion.example.com:2222", user: "jumpuser", host: "bastion.example.com", port: "2222"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseJumpHost(tt.raw, "netops")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.username != tt.user || got.host != tt.host || got.port != tt.port {
+				t.Fatalf("parseJumpHost()=%+v, want user=%s host=%s port=%s", got, tt.user, tt.host, tt.port)
+			}
+		})
+	}
+}
+
+func TestCleanInteractiveOutputDropsEchoPagingAndPrompt(t *testing.T) {
+	prompt := New(Config{HostKeyMode: "insecure"}).Config.PromptPattern
+	re := mustRegexp(t, prompt)
+	raw := []byte("\r\nshow running-config\r\nversion 17.9\r\n --More--\r\nusername admin password 0 cisco\r\nrouter#")
+	got := string(cleanInteractiveOutput(raw, "show running-config", re))
+	if strings.Contains(got, "show running-config") || strings.Contains(got, "--More--") || strings.Contains(got, "router#") {
+		t.Fatalf("interactive cleanup left shell artifacts: %q", got)
+	}
+	if !strings.Contains(got, "version 17.9") {
+		t.Fatalf("interactive cleanup lost config content: %q", got)
+	}
+}
+
 func testPublicKey(t *testing.T) ssh.PublicKey {
 	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
@@ -60,4 +99,13 @@ func testPublicKey(t *testing.T) ssh.PublicKey {
 		t.Fatal(err)
 	}
 	return key
+}
+
+func mustRegexp(t *testing.T, pattern string) *regexp.Regexp {
+	t.Helper()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return re
 }

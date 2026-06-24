@@ -1,0 +1,13 @@
+backup@junos-edge-1> show configuration | display set | no-more
+## Last commit: 2026-06-24 07:15:00 UTC by backup
+set system host-name junos-edge-1
+set system root-authentication encrypted-password "$6$junosRoot"
+set system login user backup class super-user
+set system login user backup authentication encrypted-password "$6$junosUser"
+set snmp community junosPublic authorization read-only
+set system radius-server 192.0.2.40 secret "$9$junosRadius"
+set protocols ospf area 0.0.0.0 interface ge-0/0/0.0 authentication-key junosOspf
+---(more 50%)---
+set interfaces ge-0/0/0 description uplink
+set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.4/24
+backup@junos-edge-1>

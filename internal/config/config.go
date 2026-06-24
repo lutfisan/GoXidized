@@ -38,21 +38,46 @@ type AuthConfig struct {
 }
 
 type SchedulerConfig struct {
-	DefaultInterval            time.Duration `yaml:"default_interval"`
-	JitterPercent              int           `yaml:"jitter_percent"`
-	MaxGlobalConcurrency       int           `yaml:"max_global_concurrency"`
-	MaxNewConnectionsPerSecond float64       `yaml:"max_new_connections_per_second"`
-	MaxPerSiteConcurrency      int           `yaml:"max_per_site_concurrency"`
-	MaxPerVendorConcurrency    int           `yaml:"max_per_vendor_concurrency"`
-	MaxPerGroupConcurrency     int           `yaml:"max_per_group_concurrency"`
-	QueueSize                  int           `yaml:"queue_size"`
-	Retry                      RetryConfig   `yaml:"retry"`
+	DefaultInterval            time.Duration  `yaml:"default_interval"`
+	Cron                       string         `yaml:"cron"`
+	Timezone                   string         `yaml:"timezone"`
+	JitterPercent              int            `yaml:"jitter_percent"`
+	JitterMax                  time.Duration  `yaml:"jitter_max"`
+	MaxGlobalConcurrency       int            `yaml:"max_global_concurrency"`
+	MaxNewConnectionsPerSecond float64        `yaml:"max_new_connections_per_second"`
+	MaxPerSiteConcurrency      int            `yaml:"max_per_site_concurrency"`
+	MaxPerVendorConcurrency    int            `yaml:"max_per_vendor_concurrency"`
+	MaxPerGroupConcurrency     int            `yaml:"max_per_group_concurrency"`
+	QueueSize                  int            `yaml:"queue_size"`
+	Retry                      RetryConfig    `yaml:"retry"`
+	Lease                      LeaseConfig    `yaml:"lease"`
+	Windows                    []WindowConfig `yaml:"windows"`
+	Blackouts                  []WindowConfig `yaml:"blackouts"`
 }
 
 type RetryConfig struct {
 	MaxAttempts    int           `yaml:"max_attempts"`
 	BackoffInitial time.Duration `yaml:"backoff_initial"`
 	BackoffMax     time.Duration `yaml:"backoff_max"`
+}
+
+type LeaseConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	WorkerID      string        `yaml:"worker_id"`
+	TTL           time.Duration `yaml:"ttl"`
+	RenewInterval time.Duration `yaml:"renew_interval"`
+}
+
+type WindowConfig struct {
+	Name     string   `yaml:"name"`
+	Days     []string `yaml:"days"`
+	Start    string   `yaml:"start"`
+	End      string   `yaml:"end"`
+	Timezone string   `yaml:"timezone"`
+	Groups   []string `yaml:"groups"`
+	Sites    []string `yaml:"sites"`
+	Vendors  []string `yaml:"vendors"`
+	Roles    []string `yaml:"roles"`
 }
 
 type InventoryConfig struct {
@@ -121,18 +146,27 @@ type TransportConfig struct {
 }
 
 type SSHConfig struct {
-	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
-	AuthTimeout     time.Duration `yaml:"auth_timeout"`
-	CommandTimeout  time.Duration `yaml:"command_timeout"`
-	IdleTimeout     time.Duration `yaml:"idle_timeout"`
-	SessionDeadline time.Duration `yaml:"session_deadline"`
-	HostKeyMode     string        `yaml:"host_key_mode"`
-	KnownHostsPath  string        `yaml:"known_hosts_path"`
-	TOFUPath        string        `yaml:"tofu_path"`
+	ConnectTimeout   time.Duration `yaml:"connect_timeout"`
+	AuthTimeout      time.Duration `yaml:"auth_timeout"`
+	CommandTimeout   time.Duration `yaml:"command_timeout"`
+	IdleTimeout      time.Duration `yaml:"idle_timeout"`
+	SessionDeadline  time.Duration `yaml:"session_deadline"`
+	InteractiveShell bool          `yaml:"interactive_shell"`
+	PromptPattern    string        `yaml:"prompt_pattern"`
+	MaxOutputBytes   int64         `yaml:"max_output_bytes"`
+	HostKeyMode      string        `yaml:"host_key_mode"`
+	KnownHostsPath   string        `yaml:"known_hosts_path"`
+	TOFUPath         string        `yaml:"tofu_path"`
 }
 
 type TelnetConfig struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled        bool          `yaml:"enabled"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
+	LoginTimeout   time.Duration `yaml:"login_timeout"`
+	CommandTimeout time.Duration `yaml:"command_timeout"`
+	IdleTimeout    time.Duration `yaml:"idle_timeout"`
+	PromptPattern  string        `yaml:"prompt_pattern"`
+	MaxOutputBytes int64         `yaml:"max_output_bytes"`
 }
 
 type RetentionConfig struct {
@@ -156,6 +190,7 @@ func Default() Config {
 		},
 		Scheduler: SchedulerConfig{
 			DefaultInterval:            24 * time.Hour,
+			Timezone:                   "UTC",
 			JitterPercent:              20,
 			MaxGlobalConcurrency:       250,
 			MaxNewConnectionsPerSecond: 10,
@@ -164,6 +199,7 @@ func Default() Config {
 			MaxPerGroupConcurrency:     100,
 			QueueSize:                  10000,
 			Retry:                      RetryConfig{MaxAttempts: 3, BackoffInitial: 30 * time.Second, BackoffMax: 30 * time.Minute},
+			Lease:                      LeaseConfig{Enabled: true, TTL: 15 * time.Minute, RenewInterval: 5 * time.Minute},
 		},
 		Inventory: InventoryConfig{
 			RefreshInterval: 5 * time.Minute,
@@ -185,8 +221,14 @@ func Default() Config {
 		Transport: TransportConfig{
 			SSH: SSHConfig{
 				ConnectTimeout: 20 * time.Second, AuthTimeout: 20 * time.Second, CommandTimeout: 60 * time.Second,
-				IdleTimeout: 30 * time.Second, SessionDeadline: 3 * time.Minute, HostKeyMode: "strict",
+				IdleTimeout: 30 * time.Second, SessionDeadline: 3 * time.Minute, InteractiveShell: true,
+				PromptPattern: `(?m)(^|\n)[^\n]{1,96}[>#]\s*$`, MaxOutputBytes: 16 << 20, HostKeyMode: "strict",
 				KnownHostsPath: "known_hosts", TOFUPath: "known_hosts.tofu",
+			},
+			Telnet: TelnetConfig{
+				Enabled: false, ConnectTimeout: 20 * time.Second, LoginTimeout: 20 * time.Second,
+				CommandTimeout: 60 * time.Second, IdleTimeout: 30 * time.Second,
+				PromptPattern: `(?m)(^|\n)[^\n]{1,96}[>#]\s*$`, MaxOutputBytes: 16 << 20,
 			},
 		},
 		Retention:     RetentionConfig{Days: 365},
@@ -234,6 +276,23 @@ func (c Config) Validate() error {
 	}
 	if c.Scheduler.MaxNewConnectionsPerSecond <= 0 {
 		return errors.New("scheduler.max_new_connections_per_second must be > 0")
+	}
+	if c.Scheduler.JitterPercent < 0 || c.Scheduler.JitterPercent > 100 {
+		return errors.New("scheduler.jitter_percent must be between 0 and 100")
+	}
+	if c.Scheduler.Cron == "" && c.Scheduler.DefaultInterval <= 0 {
+		return errors.New("scheduler.default_interval must be > 0 when scheduler.cron is empty")
+	}
+	if c.Scheduler.Lease.Enabled && c.Scheduler.Lease.TTL <= 0 {
+		return errors.New("scheduler.lease.ttl must be > 0 when leases are enabled")
+	}
+	if c.Scheduler.Lease.Enabled && c.Scheduler.Lease.RenewInterval <= 0 {
+		return errors.New("scheduler.lease.renew_interval must be > 0 when leases are enabled")
+	}
+	for _, window := range append(append([]WindowConfig{}, c.Scheduler.Windows...), c.Scheduler.Blackouts...) {
+		if window.Start == "" || window.End == "" {
+			return fmt.Errorf("scheduler window %q must include start and end", window.Name)
+		}
 	}
 	if len(c.Inventory.Sources) == 0 {
 		return errors.New("at least one inventory source is required")
