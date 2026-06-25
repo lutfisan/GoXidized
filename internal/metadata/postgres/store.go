@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -28,19 +29,108 @@ type Store struct {
 }
 
 func (s *Store) ValidateAPIToken(ctx context.Context, token string) (string, error) {
+	principal, err := s.ValidateAuthToken(ctx, token)
+	if err != nil {
+		return "", err
+	}
+	return principal.ActorID, nil
+}
+
+func (s *Store) ValidateAuthToken(ctx context.Context, token string) (goxidized.Principal, error) {
 	if token == "" {
-		return "", pgx.ErrNoRows
+		return goxidized.Principal{}, pgx.ErrNoRows
 	}
 	sum := sha256.Sum256([]byte(token))
 	tokenHash := hex.EncodeToString(sum[:])
-	var actorID string
+	var tokenID, actorID, roleID, tokenType string
+	var expiresAt sql.NullTime
 	err := s.pool.QueryRow(ctx, `
-SELECT actor_id FROM api_tokens
+UPDATE api_tokens
+SET last_used_at = now()
 WHERE token_hash=$1
   AND revoked_at IS NULL
   AND (expires_at IS NULL OR expires_at > now())
-LIMIT 1`, tokenHash).Scan(&actorID)
-	return actorID, err
+RETURNING id, actor_id, role_id, token_type, expires_at`, tokenHash).Scan(&tokenID, &actorID, &roleID, &tokenType, &expiresAt)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	if tokenType == "oidc_session" {
+		principal, err := s.principalByUserID(ctx, actorID)
+		if err != nil {
+			return goxidized.Principal{}, err
+		}
+		principal.AuthMethod = "oidc_session"
+		principal.TokenID = tokenID
+		if expiresAt.Valid {
+			principal.ExpiresAt = expiresAt.Time
+		}
+		return principal, nil
+	}
+	permissions, err := s.permissionsForRole(ctx, roleID)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	principal := goxidized.Principal{
+		ActorID:     actorID,
+		ActorType:   "api_token",
+		AuthMethod:  "api_token",
+		Roles:       []string{roleID},
+		Permissions: permissions,
+		TokenID:     tokenID,
+	}
+	if expiresAt.Valid {
+		principal.ExpiresAt = expiresAt.Time
+	}
+	return principal, nil
+}
+
+func (s *Store) ResolveOIDCPrincipal(ctx context.Context, subject string) (goxidized.Principal, error) {
+	if subject == "" {
+		return goxidized.Principal{}, pgx.ErrNoRows
+	}
+	principal, err := s.principalBySubject(ctx, subject)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	if len(principal.Roles) == 0 {
+		return goxidized.Principal{}, errors.New("oidc user has no roles")
+	}
+	principal.AuthMethod = "oidc"
+	return principal, nil
+}
+
+func (s *Store) CreateOIDCSession(ctx context.Context, tokenHash string, principal goxidized.Principal, expiresAt time.Time) (string, error) {
+	if tokenHash == "" {
+		return "", errors.New("session token hash is required")
+	}
+	if principal.ActorID == "" {
+		return "", errors.New("session principal actor id is required")
+	}
+	if len(principal.Roles) == 0 {
+		return "", errors.New("session principal must have at least one role")
+	}
+	if expiresAt.IsZero() {
+		return "", errors.New("session expiry is required")
+	}
+	id := newID("sess")
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO api_tokens (id, token_hash, actor_id, role_id, token_type, expires_at, created_at)
+VALUES ($1,$2,$3,$4,'oidc_session',$5,now())`,
+		id, tokenHash, principal.ActorID, principal.Roles[0], expiresAt)
+	return id, err
+}
+
+func (s *Store) RevokeAuthToken(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(token))
+	tokenHash := hex.EncodeToString(sum[:])
+	_, err := s.pool.Exec(ctx, `
+UPDATE api_tokens
+SET revoked_at = now()
+WHERE token_hash=$1 AND revoked_at IS NULL`, tokenHash)
+	return err
 }
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -366,6 +456,88 @@ FROM audit_events ORDER BY created_at DESC LIMIT $1`, limit)
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) principalBySubject(ctx context.Context, subject string) (goxidized.Principal, error) {
+	var principal goxidized.Principal
+	err := s.pool.QueryRow(ctx, `
+SELECT id, subject, display_name
+FROM users
+WHERE subject=$1`, subject).Scan(&principal.ActorID, &principal.Subject, &principal.DisplayName)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	principal.ActorType = "user"
+	return s.withRoles(ctx, principal)
+}
+
+func (s *Store) principalByUserID(ctx context.Context, userID string) (goxidized.Principal, error) {
+	var principal goxidized.Principal
+	err := s.pool.QueryRow(ctx, `
+SELECT id, subject, display_name
+FROM users
+WHERE id=$1`, userID).Scan(&principal.ActorID, &principal.Subject, &principal.DisplayName)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	principal.ActorType = "user"
+	return s.withRoles(ctx, principal)
+}
+
+func (s *Store) withRoles(ctx context.Context, principal goxidized.Principal) (goxidized.Principal, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT r.id, r.permissions
+FROM user_roles ur
+JOIN roles r ON r.id = ur.role_id
+WHERE ur.user_id=$1
+ORDER BY r.id`, principal.ActorID)
+	if err != nil {
+		return goxidized.Principal{}, err
+	}
+	defer rows.Close()
+	permissionSet := make(map[string]struct{})
+	for rows.Next() {
+		var roleID string
+		var raw []byte
+		if err := rows.Scan(&roleID, &raw); err != nil {
+			return goxidized.Principal{}, err
+		}
+		principal.Roles = append(principal.Roles, roleID)
+		var permissions []string
+		if err := json.Unmarshal(raw, &permissions); err != nil {
+			return goxidized.Principal{}, err
+		}
+		for _, permission := range permissions {
+			permissionSet[permission] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return goxidized.Principal{}, err
+	}
+	principal.Permissions = sortedKeys(permissionSet)
+	return principal, nil
+}
+
+func (s *Store) permissionsForRole(ctx context.Context, roleID string) ([]string, error) {
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, `SELECT permissions FROM roles WHERE id=$1`, roleID).Scan(&raw); err != nil {
+		return nil, err
+	}
+	var permissions []string
+	if err := json.Unmarshal(raw, &permissions); err != nil {
+		return nil, err
+	}
+	sort.Strings(permissions)
+	return permissions, nil
+}
+
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func scanTarget(row pgx.Row) (goxidized.Target, error) {

@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GoXidized</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <div id="login" class="login-view" hidden>
+      <main class="login-card" aria-labelledby="login-title">
+        <section class="login-copy">
+          <p class="app-mark">GoXidized</p>
+          <h1 id="login-title">Network configuration backup</h1>
+          <p class="login-subtitle">Sign in to view device status, sanitized configs, diffs, and backup jobs.</p>
+          <div class="login-actions">
+            <a class="button primary" href="/auth/oidc/login">Sign in with OIDC</a>
+          </div>
+          <form id="token-form" class="token-form" autocomplete="off">
+            <label for="token-input">Fallback API token</label>
+            <div class="token-row">
+              <input id="token-input" name="token" type="password" placeholder="Paste Bearer token" />
+              <button class="button secondary" type="submit">Use Token</button>
+            </div>
+            <p id="login-error" class="form-error" role="alert"></p>
+          </form>
+        </section>
+        <aside class="login-asset" aria-hidden="true">
+          <img src="/ui/assets/network-backup-empty.png" alt="" />
+        </aside>
+      </main>
+    </div>
+
+    <div id="app" class="app-shell" hidden>
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <span class="brand-icon">G</span>
+          <span>GoXidized</span>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-item active" data-section="dashboard">Dashboard</button>
+          <button class="nav-item" data-section="devices">Devices</button>
+          <button class="nav-item" data-section="jobs" data-perm="jobs:read">Jobs</button>
+          <button class="nav-item" data-section="configs" data-perm="configs:read">Configs</button>
+          <button class="nav-item" data-section="diffs" data-perm="configs:read configs:diff">Diffs</button>
+          <button class="nav-item" data-section="drivers" data-perm="drivers:read">Drivers</button>
+          <button class="nav-item" data-section="audit" data-perm="audit:read">Audit</button>
+        </nav>
+        <div class="token-access">
+          <button id="replace-token" class="ghost-button" type="button">Token fallback</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Dashboard</h1>
+            <p>Network configuration backup overview</p>
+          </div>
+          <div class="topbar-actions">
+            <span id="oidc-state" class="session-chip">Session</span>
+            <span id="principal" class="principal-chip">Loading</span>
+            <button id="trigger-selected" class="button primary" type="button" data-perm="backups:run">Trigger Backup</button>
+            <button id="refresh" class="button secondary" type="button">Refresh</button>
+            <button id="logout" class="ghost-button" type="button">Logout</button>
+          </div>
+        </header>
+
+        <section class="content-grid">
+          <div class="main-column">
+            <section class="panel filter-panel" aria-label="Device filters">
+              <label>Group<select id="group-filter"></select></label>
+              <label>Vendor<select id="vendor-filter"></select></label>
+              <label>Site<select id="site-filter"></select></label>
+              <label>Status<select id="status-filter"></select></label>
+              <label class="search-label">Search<input id="search" type="search" placeholder="Search devices" /></label>
+            </section>
+
+            <section class="panel table-panel">
+              <div class="panel-title-row">
+                <div>
+                  <h2>Device Status</h2>
+                  <p id="device-count">0 devices</p>
+                </div>
+                <button id="reload-inventory" class="button secondary" type="button" data-perm="inventory:reload">Reload Inventory</button>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Status</th>
+                      <th>Device</th>
+                      <th>Group</th>
+                      <th>Vendor</th>
+                      <th>Site</th>
+                      <th>Last Backup</th>
+                      <th>Result</th>
+                    </tr>
+                  </thead>
+                  <tbody id="device-rows"></tbody>
+                </table>
+              </div>
+              <div id="empty-devices" class="empty-state" hidden>
+                <img src="/ui/assets/network-backup-empty.png" alt="" />
+                <h3>No devices match the current filters</h3>
+                <p>Adjust filters or reload inventory.</p>
+              </div>
+            </section>
+
+            <section class="panel summary-panel">
+              <div>
+                <h2>Job Status Summary</h2>
+                <p id="runtime-status">Readiness unknown</p>
+              </div>
+              <div id="summary-cards" class="summary-cards"></div>
+            </section>
+          </div>
+
+          <aside class="detail-panel" aria-label="Selected device detail">
+            <div class="detail-header">
+              <div>
+                <p class="muted-label">Selected Device</p>
+                <h2 id="detail-title">Select a device</h2>
+              </div>
+              <span id="detail-status" class="status-pill muted">No selection</span>
+            </div>
+            <div id="detail-meta" class="detail-meta"></div>
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-tab="overview" type="button">Overview</button>
+              <button class="tab" data-tab="config" data-perm="configs:read" type="button">Config</button>
+              <button class="tab" data-tab="diff" data-perm="configs:read configs:diff" type="button">Diff</button>
+              <button class="tab" data-tab="jobs" data-perm="jobs:read" type="button">Jobs</button>
+            </div>
+            <div id="tab-content" class="tab-content"></div>
+          </aside>
+        </section>
+
+        <section class="panel driver-panel" data-perm="drivers:read">
+          <div class="panel-title-row">
+            <div>
+              <h2>Drivers And Inventory</h2>
+              <p id="drivers-copy">Driver list requires permission.</p>
+            </div>
+            <button id="driver-test" class="button secondary" type="button" data-perm="drivers:test">Test Selected Driver</button>
+          </div>
+          <div id="driver-list" class="driver-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" hidden role="status"></div>
+    <script src="/ui/app.js"></script>
+  </body>
+</html>

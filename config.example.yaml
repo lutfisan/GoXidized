@@ -6,7 +6,16 @@ server:
   auth:
     api_tokens_enabled: true
     bootstrap_token_env: GOXIDIZED_BOOTSTRAP_TOKEN
-    oidc_enabled: false
+    oidc:
+      enabled: false
+      issuer_url: ""
+      client_id: ""
+      client_secret_env: GOXIDIZED_OIDC_CLIENT_SECRET
+      redirect_url: "http://127.0.0.1:8080/auth/oidc/callback"
+      scopes: [openid, profile, email]
+      session_ttl: 8h
+      cookie_name: goxidized_session
+      require_email_verified: true
 
 scheduler:
   default_interval: 24h

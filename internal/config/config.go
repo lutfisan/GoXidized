@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -32,9 +33,26 @@ type ServerConfig struct {
 }
 
 type AuthConfig struct {
-	APITokensEnabled  bool   `yaml:"api_tokens_enabled"`
-	BootstrapTokenEnv string `yaml:"bootstrap_token_env"`
-	OIDCEnabled       bool   `yaml:"oidc_enabled"`
+	APITokensEnabled  bool       `yaml:"api_tokens_enabled"`
+	BootstrapTokenEnv string     `yaml:"bootstrap_token_env"`
+	OIDCEnabled       bool       `yaml:"oidc_enabled,omitempty"`
+	OIDC              OIDCConfig `yaml:"oidc"`
+}
+
+type OIDCConfig struct {
+	Enabled              bool          `yaml:"enabled"`
+	IssuerURL            string        `yaml:"issuer_url"`
+	ClientID             string        `yaml:"client_id"`
+	ClientSecretEnv      string        `yaml:"client_secret_env"`
+	RedirectURL          string        `yaml:"redirect_url"`
+	Scopes               []string      `yaml:"scopes"`
+	SessionTTL           time.Duration `yaml:"session_ttl"`
+	CookieName           string        `yaml:"cookie_name"`
+	RequireEmailVerified bool          `yaml:"require_email_verified"`
+}
+
+func (a AuthConfig) OIDCActive() bool {
+	return a.OIDC.Enabled || a.OIDCEnabled
 }
 
 type SchedulerConfig struct {
@@ -186,6 +204,13 @@ func Default() Config {
 			Auth: AuthConfig{
 				APITokensEnabled:  true,
 				BootstrapTokenEnv: "GOXIDIZED_BOOTSTRAP_TOKEN",
+				OIDC: OIDCConfig{
+					ClientSecretEnv:      "GOXIDIZED_OIDC_CLIENT_SECRET",
+					Scopes:               []string{"openid", "profile", "email"},
+					SessionTTL:           8 * time.Hour,
+					CookieName:           "goxidized_session",
+					RequireEmailVerified: true,
+				},
 			},
 		},
 		Scheduler: SchedulerConfig{
@@ -268,8 +293,29 @@ func (c Config) Validate() error {
 	if c.Server.TLSEnabled && (c.Server.TLSCertFile == "" || c.Server.TLSKeyFile == "") {
 		return errors.New("server.tls_cert_file and server.tls_key_file are required when tls_enabled is true")
 	}
-	if c.Server.Auth.OIDCEnabled {
-		return errors.New("oidc auth is not implemented yet; set server.auth.oidc_enabled=false")
+	if c.Server.Auth.OIDCActive() {
+		oidc := c.Server.Auth.OIDC
+		if oidc.IssuerURL == "" {
+			return errors.New("server.auth.oidc.issuer_url is required when OIDC is enabled")
+		}
+		if oidc.ClientID == "" {
+			return errors.New("server.auth.oidc.client_id is required when OIDC is enabled")
+		}
+		if oidc.ClientSecretEnv == "" {
+			return errors.New("server.auth.oidc.client_secret_env is required when OIDC is enabled")
+		}
+		if oidc.RedirectURL == "" {
+			return errors.New("server.auth.oidc.redirect_url is required when OIDC is enabled")
+		}
+		if oidc.SessionTTL <= 0 {
+			return errors.New("server.auth.oidc.session_ttl must be > 0 when OIDC is enabled")
+		}
+		if oidc.CookieName == "" || strings.ContainsAny(oidc.CookieName, " \t\r\n;") {
+			return errors.New("server.auth.oidc.cookie_name must be a valid cookie name")
+		}
+		if !contains(oidc.Scopes, "openid") {
+			return errors.New("server.auth.oidc.scopes must include openid")
+		}
 	}
 	if c.Scheduler.MaxGlobalConcurrency <= 0 {
 		return errors.New("scheduler.max_global_concurrency must be > 0")
@@ -312,4 +358,13 @@ func (c Config) Validate() error {
 		return errors.New("redaction.strict_mode requires redaction.enabled")
 	}
 	return nil
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

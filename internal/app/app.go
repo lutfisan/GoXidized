@@ -107,9 +107,30 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, err
 		WorkerID: cfg.Scheduler.Lease.WorkerID, LeaseStore: leaseStore, LeaseTTL: cfg.Scheduler.Lease.TTL, LeaseRenewInterval: cfg.Scheduler.Lease.RenewInterval,
 	}, runner.Handle)
 	a := &App{Config: cfg, Metadata: meta, Storage: storage, Scheduler: mgr, Runner: runner, schedule: schedule, logger: logger}
+	var oidcAuth api.OIDCAuthenticator
+	if cfg.Server.Auth.OIDCActive() {
+		secret := os.Getenv(cfg.Server.Auth.OIDC.ClientSecretEnv)
+		if secret == "" {
+			meta.Close()
+			return nil, fmt.Errorf("%s is required when OIDC auth is enabled", cfg.Server.Auth.OIDC.ClientSecretEnv)
+		}
+		oidcAuth, err = api.NewOIDCAuthenticator(ctx, api.OIDCSettings{
+			IssuerURL:    cfg.Server.Auth.OIDC.IssuerURL,
+			ClientID:     cfg.Server.Auth.OIDC.ClientID,
+			ClientSecret: secret,
+			RedirectURL:  cfg.Server.Auth.OIDC.RedirectURL,
+			Scopes:       cfg.Server.Auth.OIDC.Scopes,
+		})
+		if err != nil {
+			meta.Close()
+			return nil, fmt.Errorf("configure oidc auth: %w", err)
+		}
+	}
 	a.API = api.Server{
-		Metadata: meta, TokenValidator: meta, Storage: storage, Scheduler: mgr, Drivers: drivers.List, ReloadInventory: a.ReloadInventory,
-		BootstrapToken: os.Getenv(cfg.Server.Auth.BootstrapTokenEnv), AuthRequired: cfg.Server.Auth.APITokensEnabled, StartedAt: time.Now().UTC(),
+		Metadata: meta, AuthStore: meta, Storage: storage, Scheduler: mgr, Drivers: drivers.List, ReloadInventory: a.ReloadInventory,
+		BootstrapToken: os.Getenv(cfg.Server.Auth.BootstrapTokenEnv), AuthRequired: cfg.Server.Auth.APITokensEnabled || cfg.Server.Auth.OIDCActive(),
+		OIDC: oidcAuth, OIDCEnabled: cfg.Server.Auth.OIDCActive(), OIDCSessionTTL: cfg.Server.Auth.OIDC.SessionTTL,
+		OIDCCookieName: cfg.Server.Auth.OIDC.CookieName, RequireEmailVerified: cfg.Server.Auth.OIDC.RequireEmailVerified, StartedAt: time.Now().UTC(),
 	}.Router()
 	return a, nil
 }

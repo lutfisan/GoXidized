@@ -18,13 +18,13 @@ Implemented:
 - Driver keys for Cisco IOS XE, Cisco IOS XR, Huawei VRP, Juniper Junos, Ericsson IPOS, and ZTE ZXR10.
 - Git storage using `go-git/v5`.
 - PostgreSQL schema for devices, jobs, results, revisions, diffs, audit events, RBAC, API tokens, worker leases, circuit breakers, and notifications.
+- API-token auth, OIDC browser login, DB-backed session tokens, route-level RBAC, and sensitive-action audit events.
+- Embedded minimal Web UI at `/ui/` with device status grid, job/config/diff detail views, manual backup triggers, driver/inventory status, OIDC login, token fallback, and RBAC-aware controls.
 - OpenAPI starter file at `docs/openapi.yaml`.
 
 Future work:
 
 - CyberArk and Vault live providers.
-- OIDC login.
-- Web UI.
 - Distributed queue / multi-worker deployment.
 
 ## Repository Layout
@@ -129,6 +129,10 @@ Important `config.yaml` fields:
 - `server.listen_address`: API bind address.
 - `server.tls_enabled`: enable TLS only when `tls_cert_file` and `tls_key_file` are set.
 - `server.auth.api_tokens_enabled`: keep enabled outside local experiments.
+- `server.auth.oidc.enabled`: enable OIDC browser login and DB-backed session tokens.
+- `server.auth.oidc.issuer_url`, `client_id`, `client_secret_env`, and `redirect_url`: provider settings for the authorization-code flow.
+- `server.auth.oidc.scopes`: must include `openid`; `profile` and `email` are recommended.
+- `server.auth.oidc.session_ttl`: short-lived session duration for OIDC logins.
 - `inventory.sources[].path`: inventory CSV path.
 - `credentials.default_provider`: `dotenv` or `encrypted-file`.
 - `credentials.dotenv.file_path`: path to the `.env` credential file. Set to empty in Docker if credentials come from environment variables.
@@ -144,6 +148,7 @@ Important `.env` fields:
 GOXIDIZED_POSTGRES_DSN=postgres://goxidized:goxidized@localhost:5432/goxidized?sslmode=disable
 GOXIDIZED_BOOTSTRAP_TOKEN=replace-with-a-long-random-token
 GOXIDIZED_REDACTION_HMAC_KEY=replace-with-a-long-random-secret
+GOXIDIZED_OIDC_CLIENT_SECRET=replace-with-oidc-client-secret
 
 LAB_XE_1_USERNAME=backup
 LAB_XE_1_PASSWORD=change-me
@@ -480,6 +485,18 @@ Manual backup trigger:
 curl -X POST -H "Authorization: Bearer $GOXIDIZED_BOOTSTRAP_TOKEN" http://127.0.0.1:8080/api/v1/devices/lab-xe-1/backup
 ```
 
+## Web UI
+
+The embedded Web UI is served by the GoXidized API process:
+
+```bash
+open http://127.0.0.1:8080/ui/
+```
+
+It uses the same RBAC-gated API routes as CLI and API clients. OIDC sessions work through the HttpOnly session cookie, and local/bootstrap access can use the token fallback form. Static UI files are public, but device data, config content, diffs, backup triggers, driver tests, inventory reload, and audit reads remain protected by API permissions.
+
+The approved launch UI concept is kept at `docs/ui/goxidized-web-ui-concept.png`; the implementation uses the generated `network-backup-empty.png` asset only for login and empty states.
+
 ## API Tokens
 
 For production-style API access, create a token and store only its SHA-256 hash:
@@ -491,6 +508,63 @@ goxidized admin create-token
 Insert the returned `token_sha256` into `api_tokens.token_hash` with an `actor_id` and `role_id`. Keep the plaintext token only in your secret manager.
 
 `GOXIDIZED_BOOTSTRAP_TOKEN` is intended for first startup and recovery. Long-lived access should use rows in `api_tokens`.
+
+Default role permissions:
+
+- `admin`: `*`
+- `operator`: device/job reads, manual backups, inventory reload, driver read/test, config read/diff
+- `security-auditor`: device/job/config/audit reads and driver reads
+- `config-viewer`: device/job/config reads and diffs plus driver reads
+- `read-only`: device/job/driver reads
+
+## OIDC Login And RBAC
+
+OIDC is optional and fail-closed. Users must be preprovisioned in PostgreSQL; claim-to-role mapping is intentionally not automatic.
+
+Enable OIDC in `config.yaml`:
+
+```yaml
+server:
+  auth:
+    oidc:
+      enabled: true
+      issuer_url: https://issuer.example
+      client_id: goxidized
+      client_secret_env: GOXIDIZED_OIDC_CLIENT_SECRET
+      redirect_url: https://goxidized.example.com/auth/oidc/callback
+      scopes: [openid, profile, email]
+      session_ttl: 8h
+      cookie_name: goxidized_session
+      require_email_verified: true
+```
+
+Preprovision an OIDC user and assign a DB role:
+
+```sql
+INSERT INTO users (id, subject, display_name)
+VALUES ('user-alice', 'oidc:https://issuer.example#provider-subject', 'Alice')
+ON CONFLICT (id) DO UPDATE SET
+    subject = EXCLUDED.subject,
+    display_name = EXCLUDED.display_name;
+
+INSERT INTO user_roles (user_id, role_id)
+VALUES ('user-alice', 'operator')
+ON CONFLICT DO NOTHING;
+```
+
+Login starts at `GET /auth/oidc/login`. The callback verifies state and nonce, exchanges the code, verifies the ID token, requires `email_verified` when configured, resolves `users.subject`, creates a short-lived `api_tokens` row with `token_type='oidc_session'`, sets an HttpOnly SameSite cookie, and redirects the browser back to `/ui/`.
+
+Check the current principal:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/auth/me
+```
+
+Logout revokes the current token:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/auth/logout
+```
 
 ## Security Notes
 
@@ -535,6 +609,7 @@ API returns unauthorized:
 
 - Confirm `Authorization: Bearer <token>` is present.
 - Confirm `GOXIDIZED_BOOTSTRAP_TOKEN` is set, or insert a SHA-256 token hash into `api_tokens`.
+- For OIDC, confirm the user exists with subject `oidc:<issuer_url>#<sub>` and has at least one row in `user_roles`.
 
 Inventory validation fails:
 
